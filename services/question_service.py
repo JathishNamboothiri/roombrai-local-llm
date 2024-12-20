@@ -1,4 +1,5 @@
 # src/services/question_service.py
+import datetime
 from typing import List, Dict, Any
 import ollama
 import json
@@ -158,79 +159,229 @@ class QuestionService:
         except json.JSONDecodeError as e:
             logger.error(f"Error parsing response: {str(e)}")
             return []
+    def calculate_difficulty_distribution(self, total_type_questions: int, request: QuestionRequest) -> Dict[str, int]:
+        """
+        Calculate how many questions of each difficulty level to generate for a specific question type.
+        
+        Args:
+            total_type_questions: Total number of questions needed for this type
+            request: QuestionRequest containing the overall difficulty distribution
+            
+        Returns:
+            Dict[str, int]: Distribution of questions by difficulty level
+        """
+        # Get the global difficulty distribution totals
+        total_questions = request.difficulty_distribution.total_questions()
+        total_easy = request.difficulty_distribution.easy
+        total_medium = request.difficulty_distribution.medium
+        total_hard = request.difficulty_distribution.hard
+        
+        logger.info(f"Calculating distribution for {total_type_questions} questions", {
+            "total_questions": total_questions,
+            "requested_distribution": {
+                "easy": total_easy,
+                "medium": total_medium,
+                "hard": total_hard
+            }
+        })
 
-    @log_async_function_call
+        # Initialize distribution with floor values
+        distribution = {
+            "Easy": (total_easy * total_type_questions) // total_questions,
+            "Medium": (total_medium * total_type_questions) // total_questions,
+            "Hard": (total_hard * total_type_questions) // total_questions
+        }
+        
+        # Calculate remaining questions to distribute
+        allocated = sum(distribution.values())
+        remaining = total_type_questions - allocated
+        
+        if remaining > 0:
+            # Calculate fractional parts
+            fractions = {
+                "Easy": (total_easy * total_type_questions / total_questions) % 1,
+                "Medium": (total_medium * total_type_questions / total_questions) % 1,
+                "Hard": (total_hard * total_type_questions / total_questions) % 1
+            }
+            
+            # Distribute remaining questions based on largest fractional parts
+            while remaining > 0:
+                max_diff = max(fractions.items(), key=lambda x: x[1])
+                distribution[max_diff[0]] += 1
+                fractions[max_diff[0]] = 0  # Mark as used
+                remaining -= 1
+        
+        # Ensure minimum of 1 question per difficulty if total_type_questions >= 3
+        if total_type_questions >= 3:
+            while any(count == 0 for count in distribution.values()):
+                # Find difficulty with 0 questions
+                zero_diff = next(diff for diff, count in distribution.items() if count == 0)
+                # Find difficulty with most questions
+                max_diff = max(distribution.items(), key=lambda x: x[1])[0]
+                
+                # Transfer one question
+                distribution[zero_diff] += 1
+                distribution[max_diff] -= 1
+        
+        logger.info(f"Calculated distribution", {
+            "type_questions": total_type_questions,
+            "distribution": distribution,
+            "total_allocated": sum(distribution.values())
+        })
+
+        # Final validation
+        if sum(distribution.values()) != total_type_questions:
+            logger.error("Invalid distribution calculation", {
+                "expected_total": total_type_questions,
+                "actual_total": sum(distribution.values()),
+                "distribution": distribution
+            })
+            raise QuestionGenerationError(
+                "Invalid difficulty distribution calculation",
+                details=[f"Expected {total_type_questions} questions, got {sum(distribution.values())}"]
+            )
+
+        return distribution
+
     async def generate_questions(self, request: QuestionRequest) -> QuestionResponse:
-        """Generate questions based on request parameters."""
+        """
+        Generate questions based on request parameters and distributions.
+        
+        Args:
+            request: QuestionRequest containing all parameters and distributions
+                
+        Returns:
+            QuestionResponse containing generated questions and metadata
+                
+        Raises:
+            QuestionGenerationError: If question generation fails or distributions don't match
+            ValidationError: If request parameters are invalid
+        """
         try:
+            # Validate total distributions match
+            if request.question_distribution.total_questions() != request.difficulty_distribution.total_questions():
+                raise ValidationError(
+                    "Distribution mismatch",
+                    details=["Question type total does not match difficulty level total"]
+                )
+
             # Get image paths
             base_path = f"/Users/developer/Desktop/que/Root/Pdf/{request.language}/Teacher/{request.syllabus}/{request.standard}/{request.subject}/{request.chapter}"
             image_paths = get_images(base_path, [".png", ".jpg", ".jpeg"])
 
             if not image_paths:
-                raise QuestionGenerationError("No images found for the specified chapter")
+                raise QuestionGenerationError(
+                    "No images found for the specified chapter",
+                    details=[f"No images found in path: {base_path}"]
+                )
 
             # Accumulate context from all images
+            logger.info("Processing images to extract context")
             accumulated_context = ""
+            
             for image_path in image_paths:
                 image_data = encode_image_to_base64(image_path)
                 if image_data:
-                    context = await self._get_image_context(image_data)
-                    accumulated_context += f"{context}\n\n"
+                    content = await self._get_image_context(image_data)
+                    if content:
+                        accumulated_context += f"{content}\n\n"
 
-            if not accumulated_context:
-                raise QuestionGenerationError("Failed to extract context from images")
+            if not accumulated_context.strip():
+                raise QuestionGenerationError(
+                    "Failed to extract context from images",
+                    details=["No meaningful content could be extracted from the images"]
+                )
 
-            # Generate questions for each type and difficulty
+            logger.info("Starting question generation with accumulated context")
+            
+            # Generate questions for each type
             all_questions = []
-
-            # Distribution of difficulties for each type
+            questions_generated = {"Easy": 0, "Medium": 0, "Hard": 0}
+            
             question_types = {
                 QuestionType.MCQ.value: request.question_distribution.multiple_choice,
                 QuestionType.MSQ.value: request.question_distribution.multiple_select,
                 QuestionType.SDQ.value: request.question_distribution.short_descriptive,
                 QuestionType.LDQ.value: request.question_distribution.long_descriptive
             }
-
-            difficulty_levels = ["Easy", "Medium", "Hard"]
-            for q_type, count in question_types.items():
-                if count > 0:
-                    for difficulty in difficulty_levels:
-                        # Calculate questions for this difficulty based on distribution
-                        if difficulty == "Easy":
-                            diff_count = (request.difficulty_distribution.easy * count) // request.question_distribution.total_questions()
-                        elif difficulty == "Medium":
-                            diff_count = (request.difficulty_distribution.medium * count) // request.question_distribution.total_questions()
-                        else:
-                            diff_count = (request.difficulty_distribution.hard * count) // request.question_distribution.total_questions()
-
-                        if diff_count > 0:
+            
+            for q_type, total_count in question_types.items():
+                if total_count > 0:
+                    logger.info(f"Processing question type: {q_type}", {
+                        "total_count": total_count,
+                        "current_totals": questions_generated
+                    })
+                    
+                    # Calculate difficulty distribution for this type
+                    type_difficulties = self.calculate_difficulty_distribution(total_count, request)
+                    
+                    # Generate questions for each difficulty level
+                    for difficulty, count in type_difficulties.items():
+                        if count > 0:
+                            logger.info(f"Generating questions", {
+                                "type": q_type,
+                                "difficulty": difficulty,
+                                "count": count
+                            })
+                            
                             questions = await self._generate_questions_for_type(
                                 accumulated_context,
                                 q_type,
-                                diff_count,
+                                count,
                                 request,
                                 difficulty
                             )
+                            
+                            if len(questions) != count:
+                                raise QuestionGenerationError(
+                                    f"Incorrect number of {difficulty} {q_type} questions generated",
+                                    details=[f"Expected {count}, got {len(questions)}"]
+                                )
+                            
                             all_questions.extend(questions)
-
-            if not all_questions:
-                raise QuestionGenerationError("Failed to generate questions")
-
+                            questions_generated[difficulty] += len(questions)
+                            
+                            logger.info(f"Successfully generated questions", {
+                                "type": q_type,
+                                "difficulty": difficulty,
+                                "count": len(questions),
+                                "running_total": questions_generated
+                            })
+            
+            # Validate final distribution matches request
+            total_generated = sum(questions_generated.values())
+            expected_total = request.question_distribution.total_questions()
+            
+            if total_generated != expected_total:
+                raise QuestionGenerationError(
+                    "Generated questions count mismatch",
+                    details=[
+                        f"Expected total: {expected_total}",
+                        f"Generated total: {total_generated}",
+                        f"Distribution: {questions_generated}"
+                    ]
+                )
+            
+            # Create and return response
             return QuestionResponse(
-                title=f"{request.standard} {request.subject} Assessment - {request.chapter}",
+                title=f"{request.standard} {request.subject} - {request.chapter}",
                 questions=all_questions,
                 metadata={
-                    "standard": request.standard,
+                    "request_id": request.request_id,
+                    "total_questions": len(all_questions),
+                    "distribution": questions_generated,
                     "subject": request.subject,
                     "chapter": request.chapter,
+                    "standard": request.standard,
                     "language": request.language,
-                    "syllabus": request.syllabus,
-                    "total_pages": len(image_paths),
-                    "question_count": len(all_questions)
-                }
+                    "syllabus": request.syllabus
+                },
+                timestamp=datetime.utcnow()
             )
-
+            
         except Exception as e:
-            logger.error(f"Error in question generation: {str(e)}")
-            raise QuestionGenerationError(str(e))
+            logger.error("Error generating questions", {
+                "error": str(e),
+                "request_id": request.request_id
+            })
+            raise
