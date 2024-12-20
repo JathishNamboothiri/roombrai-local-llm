@@ -1,0 +1,12 @@
+# requirements.txt
+fastapi
+uvicorn
+pydantic
+pydantic-settings
+python-multipart
+ollama
+Pillow
+pdf2image
+python-jose
+python-dotenv
+httpx
